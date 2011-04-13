@@ -1,0 +1,13 @@
+google-authenticator (20110413.68230188bdc7-1) unstable; urgency=low
+
+  * Upstream update.
+  * Added FILEFORMAT and totp.html .
+  * debian/copyright now includes hints for The MIT License.
+
+ -- LENART Janos <ocsi@debian.org>  Wed, 13 Apr 2011 08:14:21 +0200
+
+google-authenticator (20110224.2b7e90a4d3-1) unstable; urgency=low
+
+  * Initial release. (Closes: #614660)
+
+ -- LENART Janos <ocsi@debian.org>  Thu, 24 Feb 2011 14:23:47 +0100
