@@ -47,17 +47,18 @@ clean:
 	               pam_google_authenticator_unittest
 
 google-authenticator: google-authenticator.o base32.o hmac.o sha1.o
-	$(CC) -g $(LDFLAGS)                                                   \
-	      -o $@ $+ -ldl
+	$(CC) -g $(LDFLAGS) $(shell [ -f /usr/lib/libdl.so ] && echo " -ldl") \
+	      -o $@ $+
 
 demo: demo.o pam_google_authenticator_demo.o base32.o hmac.o sha1.o
 	$(CC) -g $(LDFLAGS) -rdynamic                                         \
-	      -o $@ $+ -ldl
+	      $(shell [ -f /usr/lib/libdl.so ] && echo " -ldl") -o $@ $+
 
 pam_google_authenticator_unittest: pam_google_authenticator_unittest.o        \
                                    base32.o hmac.o sha1.o
 	$(CC) -g $(LDFLAGS) -rdynamic -lc                                     \
-              -o $@ $+ -ldl
+              $(shell [ -f /usr/lib/libdl.so ] && echo " -ldl")               \
+              -o $@ $+
 
 pam_google_authenticator.so: base32.o hmac.o sha1.o
 pam_google_authenticator_testing.so: base32.o hmac.o sha1.o
