@@ -18,6 +18,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <security/pam_appl.h>
 #include <security/pam_modules.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -41,12 +42,16 @@ static sigjmp_buf jmpbuf;
 
 static int conversation(int num_msg, const struct pam_message **msg,
                         struct pam_response **resp, void *appdata_ptr) {
-  if (num_msg == 1 && msg[0]->msg_style == PAM_PROMPT_ECHO_OFF) {
+  if (num_msg == 1 &&
+      (msg[0]->msg_style == PAM_PROMPT_ECHO_OFF ||
+       msg[0]->msg_style == PAM_PROMPT_ECHO_ON)) {
     *resp = malloc(sizeof(struct pam_response));
     assert(*resp);
     (*resp)->resp = calloc(1024, 0);
     struct termios termios = old_termios;
-    termios.c_lflag &= ~(ECHO|ECHONL);
+    if (msg[0]->msg_style == PAM_PROMPT_ECHO_OFF) {
+      termios.c_lflag &= ~(ECHO|ECHONL);
+    }
     sigsetjmp(jmpbuf, 1);
     jmpbuf_valid = 1;
     sigset_t mask;
@@ -70,7 +75,13 @@ static int conversation(int num_msg, const struct pam_message **msg,
   return PAM_CONV_ERR;
 }
 
-int pam_get_item(const pam_handle_t *pamh, int item_type, const void **item) {
+#ifdef sun
+#define PAM_CONST
+#else
+#define PAM_CONST const
+#endif
+int pam_get_item(const pam_handle_t *pamh, int item_type,
+                 PAM_CONST void **item) {
   switch (item_type) {
     case PAM_SERVICE: {
       static const char *service = "google_authenticator_demo";
@@ -87,6 +98,16 @@ int pam_get_item(const pam_handle_t *pamh, int item_type, const void **item) {
       memcpy(item, &p_conv, sizeof(p_conv));
       return PAM_SUCCESS;
     }
+    default:
+      return PAM_BAD_ITEM;
+  }
+}
+
+int pam_set_item(pam_handle_t *pamh, int item_type,
+                 PAM_CONST void *item) {
+  switch (item_type) {
+    case PAM_AUTHTOK:
+      return PAM_SUCCESS;
     default:
       return PAM_BAD_ITEM;
   }
