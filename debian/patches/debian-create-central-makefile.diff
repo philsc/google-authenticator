@@ -1,0 +1,15 @@
+Description: Make debhelper happy
+Author: LENART Janos <ocsi@debian.org>
+Origin: vendor
+Last-Update: 2013-05-29
+
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,7 @@
++.PHONY: build
++.DEFAULT: build
++build:
++	$(MAKE) -C libpam all
++
++distclean:
++	$(MAKE) -C libpam clean

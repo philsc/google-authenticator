@@ -1,7 +1,3 @@
-#
-# This file makes debhelper happy
-#
-
 .PHONY: build
 .DEFAULT: build
 build:

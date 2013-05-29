@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -36,8 +37,17 @@
 #define HAS_SETFSUID
 #endif
 
+#ifndef PAM_EXTERN
+#define PAM_EXTERN
+#endif
+
+#if !defined(LOG_AUTHPRIV) && defined(LOG_AUTH)
+#define LOG_AUTHPRIV LOG_AUTH
+#endif
+
 #define PAM_SM_AUTH
 #define PAM_SM_SESSION
+#include <security/pam_appl.h>
 #include <security/pam_modules.h>
 
 #include "base32.h"
@@ -49,7 +59,13 @@
 
 typedef struct Params {
   const char *secret_filename_spec;
+  enum { NULLERR=0, NULLOK, SECRETNOTFOUND } nullok;
   int        noskewadj;
+  int        echocode;
+  int        fixed_uid;
+  uid_t      uid;
+  enum { PROMPT = 0, TRY_FIRST_PASS, USE_FIRST_PASS } pass_mode;
+  int        forward_pass;
 } Params;
 
 static char oom;
@@ -57,6 +73,7 @@ static char oom;
 #if defined(DEMO) || defined(TESTING)
 static char error_msg[128];
 
+const char *get_error_msg(void) __attribute__((visibility("default")));
 const char *get_error_msg(void) {
   return error_msg;
 }
@@ -87,6 +104,10 @@ static void log_message(int priority, pam_handle_t *pamh,
 
   va_end(args);
 
+  if (priority == LOG_EMERG) {
+    // Something really bad happened. There is no way we can proceed safely.
+    _exit(1);
+  }
 }
 
 static int converse(pam_handle_t *pamh, int nargs,
@@ -120,28 +141,31 @@ static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
     ? params->secret_filename_spec : SECRET;
 
   // Obtain the user's id and home directory
-  struct passwd pwbuf, *pw;
-  #ifdef _SC_GETPW_R_SIZE_MAX
-  int len = sysconf(_SC_GETPW_R_SIZE_MAX);
-  if (len <= 0) {
-    len = 4096;
-  }
-  #else
-  int len = 4096;
-  #endif
-  char *buf = malloc(len);
+  struct passwd pwbuf, *pw = NULL;
+  char *buf = NULL;
   char *secret_filename = NULL;
-  *uid = -1;
-  if (buf == NULL ||
-      getpwnam_r(username, &pwbuf, buf, len, &pw) ||
-      !pw ||
-      !pw->pw_dir ||
-      *pw->pw_dir != '/') {
-  err:
-    log_message(LOG_ERR, pamh, "Failed to compute location of secret file");
-    free(buf);
-    free(secret_filename);
-    return NULL;
+  if (!params->fixed_uid) {
+    #ifdef _SC_GETPW_R_SIZE_MAX
+    int len = sysconf(_SC_GETPW_R_SIZE_MAX);
+    if (len <= 0) {
+      len = 4096;
+    }
+    #else
+    int len = 4096;
+    #endif
+    buf = malloc(len);
+    *uid = -1;
+    if (buf == NULL ||
+        getpwnam_r(username, &pwbuf, buf, len, &pw) ||
+        !pw ||
+        !pw->pw_dir ||
+        *pw->pw_dir != '/') {
+    err:
+      log_message(LOG_ERR, pamh, "Failed to compute location of secret file");
+      free(buf);
+      free(secret_filename);
+      return NULL;
+    }
   }
 
   // Expand filename specification to an actual filename.
@@ -156,11 +180,17 @@ static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
     const char *subst = NULL;
     if (allow_tilde && *cur == '~') {
       var_len = 1;
+      if (!pw) {
+        goto err;
+      }
       subst = pw->pw_dir;
       var = cur;
     } else if (secret_filename[offset] == '$') {
       if (!memcmp(cur, "${HOME}", 7)) {
         var_len = 7;
+        if (!pw) {
+          goto err;
+        }
         subst = pw->pw_dir;
         var = cur;
       } else if (!memcmp(cur, "${USER}", 7)) {
@@ -188,8 +218,8 @@ static char *get_secret_filename(pam_handle_t *pamh, const Params *params,
     }
   }
 
+  *uid = params->fixed_uid ? params->uid : pw->pw_uid;
   free(buf);
-  *uid = pw->pw_uid;
   return secret_filename;
 }
 
@@ -211,20 +241,90 @@ static int setuser(int uid) {
   return old_uid;
 }
 
-static int drop_privileges(pam_handle_t *pamh, const char *username, int uid) {
-  // Try to become the new user. This might be necessary for NFS mounted home
-  // directories.
-  int old_uid = setuser(uid);
-  if (old_uid < 0) {
-    log_message(LOG_ERR, pamh, "Failed to change user id to \"%s\"", username);
+static int setgroup(int gid) {
+#ifdef HAS_SETFSUID
+  // The semantics of setfsgid() are a little unusual. On success, the
+  // previous group id is returned. On failure, the current groupd id is
+  // returned.
+  int old_gid = setfsgid(gid);
+  if (gid != setfsgid(gid)) {
+    setfsgid(old_gid);
     return -1;
   }
-  return old_uid;
+#else
+  int old_gid = getegid();
+  if (old_gid != gid && setegid(gid)) {
+    return -1;
+  }
+#endif
+  return old_gid;
+}
+
+static int drop_privileges(pam_handle_t *pamh, const char *username, int uid,
+                           int *old_uid, int *old_gid) {
+  // Try to become the new user. This might be necessary for NFS mounted home
+  // directories.
+
+  // First, look up the user's default group
+  #ifdef _SC_GETPW_R_SIZE_MAX
+  int len = sysconf(_SC_GETPW_R_SIZE_MAX);
+  if (len <= 0) {
+    len = 4096;
+  }
+  #else
+  int len = 4096;
+  #endif
+  char *buf = malloc(len);
+  if (!buf) {
+    log_message(LOG_ERR, pamh, "Out of memory");
+    return -1;
+  }
+  struct passwd pwbuf, *pw;
+  if (getpwuid_r(uid, &pwbuf, buf, len, &pw) || !pw) {
+    log_message(LOG_ERR, pamh, "Cannot look up user id %d", uid);
+    free(buf);
+    return -1;
+  }
+  gid_t gid = pw->pw_gid;
+  free(buf);
+
+  int gid_o = setgroup(gid);
+  int uid_o = setuser(uid);
+  if (uid_o < 0) {
+    if (gid_o >= 0) {
+      if (setgroup(gid_o) < 0 || setgroup(gid_o) != gid_o) {
+        // Inform the caller that we were unsuccessful in resetting the group.
+        *old_gid = gid_o;
+      }
+    }
+    log_message(LOG_ERR, pamh, "Failed to change user id to \"%s\"",
+                username);
+    return -1;
+  }
+  if (gid_o < 0 && (gid_o = setgroup(gid)) < 0) {
+    // In most typical use cases, the PAM module will end up being called
+    // while uid=0. This allows the module to change to an arbitrary group
+    // prior to changing the uid. But there are many ways that PAM modules
+    // can be invoked and in some scenarios this might not work. So, we also
+    // try changing the group _after_ changing the uid. It might just work.
+    if (setuser(uid_o) < 0 || setuser(uid_o) != uid_o) {
+      // Inform the caller that we were unsuccessful in resetting the uid.
+      *old_uid = uid_o;
+    }
+    log_message(LOG_ERR, pamh,
+                "Failed to change group id for user \"%s\" to %d", username,
+                (int)gid);
+    return -1;
+  }
+
+  *old_uid = uid_o;
+  *old_gid = gid_o;
+  return 0;
 }
 
 static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
-                            const char *username, int uid, off_t *size,
-                            time_t *mtime) {
+                            struct Params *params, const char *username,
+                            int uid, off_t *size, time_t *mtime) {
   // Try to open "~/.google_authenticator"
   *size = 0;
   *mtime = 0;
@@ -232,7 +332,14 @@ static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
   struct stat sb;
   if (fd < 0 ||
       fstat(fd, &sb) < 0) {
-    log_message(LOG_ERR, pamh, "Failed to read \"%s\"", secret_filename);
+    if (params->nullok != NULLERR && errno == ENOENT) {
+      // The user doesn't have a state file, but the admininistrator said
+      // that this is OK. We still return an error from open_secret_file(),
+      // but we remember that this was the result of a missing state file.
+      params->nullok = SECRETNOTFOUND;
+    } else {
+      log_message(LOG_ERR, pamh, "Failed to read \"%s\"", secret_filename);
+    }
  error:
     if (fd >= 0) {
       close(fd);
@@ -244,8 +351,13 @@ static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
   if ((sb.st_mode & 03577) != 0400 ||
       !S_ISREG(sb.st_mode) ||
       sb.st_uid != (uid_t)uid) {
+    char buf[80];
+    if (params->fixed_uid) {
+      sprintf(buf, "user id %d", params->uid);
+      username = buf;
+    }
     log_message(LOG_ERR, pamh,
-                "Secret file \"%s\" must only be accessible by \"%s\"",
+                "Secret file \"%s\" must only be accessible by %s",
                 secret_filename, username);
     goto error;
   }
@@ -376,6 +488,7 @@ static uint8_t *get_shared_secret(pam_handle_t *pamh,
 
 #ifdef TESTING
 static time_t current_time;
+void set_time(time_t t) __attribute__((visibility("default")));
 void set_time(time_t t) {
   current_time = t;
 }
@@ -510,6 +623,22 @@ static int set_cfg_value(pam_handle_t *pamh, const char *key, const char *val,
   return 0;
 }
 
+static long get_hotp_counter(pam_handle_t *pamh, const char *buf) {
+  const char *counter_str = get_cfg_value(pamh, "HOTP_COUNTER", buf);
+  if (counter_str == &oom) {
+    // Out of memory. This is a fatal error
+    return -1;
+  }
+
+  long counter = 0;
+  if (counter_str) {
+    counter = strtol(counter_str, NULL, 10);
+  }
+  free((void *)counter_str);
+
+  return counter;
+}
+
 static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
                       int *updated, char **buf) {
   const char *value = get_cfg_value(pamh, "RATE_LIMIT", *buf);
@@ -523,14 +652,16 @@ static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
 
   // Parse both the maximum number of login attempts and the time interval
   // that we are looking at.
-  const char *endptr = value;
+  const char *endptr = value, *ptr;
   int attempts, interval;
   errno = 0;
-  if (((attempts = (int)strtoul(endptr, (char **)&endptr, 10)) < 1) ||
+  if (((attempts = (int)strtoul(ptr = endptr, (char **)&endptr, 10)) < 1) ||
+      ptr == endptr ||
       attempts > 100 ||
       errno ||
       (*endptr != ' ' && *endptr != '\t') ||
-      ((interval = (int)strtoul(endptr, (char **)&endptr, 10)) < 1) ||
+      ((interval = (int)strtoul(ptr = endptr, (char **)&endptr, 10)) < 1) ||
+      ptr == endptr ||
       interval > 3600 ||
       errno) {
     free((void *)value);
@@ -545,7 +676,7 @@ static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
   if (!timestamps) {
   oom:
     free((void *)value);
-    log_message(LOG_ERR, pamh, "Out of memory!");
+    log_message(LOG_ERR, pamh, "Out of memory");
     return -1;
   }
   timestamps[0] = now;
@@ -554,7 +685,9 @@ static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
     unsigned int timestamp;
     errno = 0;
     if ((*endptr != ' ' && *endptr != '\t') ||
-        ((timestamp = (int)strtoul(endptr, (char **)&endptr, 10)), errno)) {
+        ((timestamp = (int)strtoul(ptr = endptr, (char **)&endptr, 10)),
+         errno) ||
+        ptr == endptr) {
       free((void *)value);
       free(timestamps);
       log_message(LOG_ERR, pamh, "Invalid list of timestamps in RATE_LIMIT. "
@@ -627,34 +760,43 @@ static int rate_limit(pam_handle_t *pamh, const char *secret_filename,
   return 0;
 }
 
-static int request_verification_code(pam_handle_t *pamh) {
+static char *get_first_pass(pam_handle_t *pamh) {
+  const void *password = NULL;
+  if (pam_get_item(pamh, PAM_AUTHTOK, &password) == PAM_SUCCESS &&
+      password) {
+    return strdup((const char *)password);
+  }
+  return NULL;
+}
+
+static char *request_pass(pam_handle_t *pamh, int echocode,
+                          const char *prompt) {
   // Query user for verification code
-  const struct pam_message msg = { .msg_style = PAM_PROMPT_ECHO_OFF,
-                                   .msg       = "Verification code: " };
+  const struct pam_message msg = { .msg_style = echocode,
+                                   .msg       = prompt };
   const struct pam_message *msgs = &msg;
   struct pam_response *resp = NULL;
   int retval = converse(pamh, 1, &msgs, &resp);
-  int code = -1;
-  char *endptr = NULL;
-  errno = 0;
-  if (retval != PAM_SUCCESS || resp == NULL || resp[0].resp == NULL ||
-      *resp[0].resp == '\000' ||
-      ((code = (int)strtoul(resp[0].resp, &endptr, 10)), *endptr) ||
-      errno) {
+  char *ret = NULL;
+  if (retval != PAM_SUCCESS || resp == NULL || resp->resp == NULL ||
+      *resp->resp == '\000') {
     log_message(LOG_ERR, pamh, "Did not receive verification code from user");
-    code = -1;
+    if (retval == PAM_SUCCESS && resp && resp->resp) {
+      ret = resp->resp;
+    }
+  } else {
+    ret = resp->resp;
   }
 
-  // Zero out any copies of the response, and deallocate temporary storage
+  // Deallocate temporary storage
   if (resp) {
-    if (resp[0].resp) {
-      memset(resp[0].resp, 0, strlen(resp[0].resp));
-      free(resp[0].resp);
+    if (!ret) {
+      free(resp->resp);
     }
     free(resp);
   }
 
-  return code;
+  return ret;
 }
 
 /* Checks for possible use of scratch codes. Returns -1 on error, 0 on success,
@@ -690,13 +832,17 @@ static int check_scratch_codes(pam_handle_t *pamh, const char *secret_filename,
     if (errno ||
         ptr == endptr ||
         (*endptr != '\r' && *endptr != '\n' && *endptr) ||
-        scratchcode < 10*1000*1000) {
+        scratchcode  <  10*1000*1000 ||
+        scratchcode >= 100*1000*1000) {
       break;
     }
 
     // Check if the code matches
     if (scratchcode == code) {
       // Remove scratch code after using it
+      while (*endptr == '\n' || *endptr == '\r') {
+        ++endptr;
+      }
       memmove(ptr, endptr, strlen(endptr) + 1);
       memset(strrchr(ptr, '\000'), 0, endptr - ptr + 1);
 
@@ -840,7 +986,10 @@ static int invalidate_timebased_code(int tm, pam_handle_t *pamh,
 /* Given an input value, this function computes the hash code that forms the
  * expected authentication token.
  */
-#ifndef TESTING
+#ifdef TESTING
+int compute_code(const uint8_t *secret, int secretLen, unsigned long value)
+  __attribute__((visibility("default")));
+#else
 static
 #endif
 int compute_code(const uint8_t *secret, int secretLen, unsigned long value) {
@@ -927,7 +1076,7 @@ static int check_time_skew(pam_handle_t *pamh, const char *secret_filename,
     if (num_entries &&
         tm + skew == tms[num_entries-1] + skews[num_entries-1]) {
       free((void *)resetting);
-      return rc;
+      return -1;
     }
   }
   free((void *)resetting);
@@ -1059,17 +1208,114 @@ static int check_timebased_code(pam_handle_t *pamh, const char*secret_filename,
     }
   }
 
-  return -1;
+  return 1;
+}
+
+/* Checks for counter based verification code. Returns -1 on error, 0 on
+ * success, and 1, if no counter based code had been entered, and subsequent
+ * tests should be applied.
+ */
+static int check_counterbased_code(pam_handle_t *pamh,
+                                   const char*secret_filename, int *updated,
+                                   char **buf, const uint8_t*secret,
+                                   int secretLen, int code, Params *params,
+                                   long hotp_counter,
+                                   int *must_advance_counter) {
+  if (hotp_counter < 1) {
+    // The secret file did not actually contain information for a counter-based
+    // code. Return to caller and see if any other authentication methods
+    // apply.
+    return 1;
+  }
+
+  if (code < 0 || code >= 1000000) {
+    // All counter based verification codes are no longer than six digits.
+    return 1;
+  }
+
+  // Compute [window_size] verification codes and compare them with user input.
+  // Future codes are allowed in case the user computed but did not use a code.
+  int window = window_size(pamh, secret_filename, *buf);
+  if (!window) {
+    return -1;
+  }
+  for (int i = 0; i < window; ++i) {
+    unsigned int hash = compute_code(secret, secretLen, hotp_counter + i);
+    if (hash == (unsigned int)code) {
+      char counter_str[40];
+      sprintf(counter_str, "%ld", hotp_counter + i + 1);
+      if (set_cfg_value(pamh, "HOTP_COUNTER", counter_str, buf) < 0) {
+        return -1;
+      }
+      *updated = 1;
+      *must_advance_counter = 0;
+      return 0;
+    }
+  }
+
+  *must_advance_counter = 1;
+  return 1;
+}
+
+static int parse_user(pam_handle_t *pamh, const char *name, uid_t *uid) {
+  char *endptr;
+  errno = 0;
+  long l = strtol(name, &endptr, 10);
+  if (!errno && endptr != name && l >= 0 && l <= INT_MAX) {
+    *uid = (uid_t)l;
+    return 0;
+  }
+  #ifdef _SC_GETPW_R_SIZE_MAX
+  int len   = sysconf(_SC_GETPW_R_SIZE_MAX);
+  if (len <= 0) {
+    len = 4096;
+  }
+  #else
+  int len   = 4096;
+  #endif
+  char *buf = malloc(len);
+  if (!buf) {
+    log_message(LOG_ERR, pamh, "Out of memory");
+    return -1;
+  }
+  struct passwd pwbuf, *pw;
+  if (getpwnam_r(name, &pwbuf, buf, len, &pw) || !pw) {
+    free(buf);
+    log_message(LOG_ERR, pamh, "Failed to look up user \"%s\"", name);
+    return -1;
+  }
+  *uid = pw->pw_uid;
+  free(buf);
+  return 0;
 }
 
 static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
                       Params *params) {
+  params->echocode = PAM_PROMPT_ECHO_OFF;
   for (int i = 0; i < argc; ++i) {
     if (!memcmp(argv[i], "secret=", 7)) {
       free((void *)params->secret_filename_spec);
       params->secret_filename_spec = argv[i] + 7;
+    } else if (!memcmp(argv[i], "user=", 5)) {
+      uid_t uid;
+      if (parse_user(pamh, argv[i] + 5, &uid) < 0) {
+        return -1;
+      }
+      params->fixed_uid = 1;
+      params->uid = uid;
+    } else if (!strcmp(argv[i], "try_first_pass")) {
+      params->pass_mode = TRY_FIRST_PASS;
+    } else if (!strcmp(argv[i], "use_first_pass")) {
+      params->pass_mode = USE_FIRST_PASS;
+    } else if (!strcmp(argv[i], "forward_pass")) {
+      params->forward_pass = 1;
     } else if (!strcmp(argv[i], "noskewadj")) {
       params->noskewadj = 1;
+    } else if (!strcmp(argv[i], "nullok")) {
+      params->nullok = NULLOK;
+    } else if (!strcmp(argv[i], "echo-verification-code") ||
+               !strcmp(argv[i], "echo_verification_code")) {
+      params->echocode = PAM_PROMPT_ECHO_ON;
     } else {
       log_message(LOG_ERR, pamh, "Unrecognized option \"%s\"", argv[i]);
       return -1;
@@ -1083,13 +1329,12 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   int        rc = PAM_SESSION_ERR;
   const char *username;
   char       *secret_filename = NULL;
-  int        uid, old_uid = -1, fd = -1;
+  int        uid = -1, old_uid = -1, old_gid = -1, fd = -1;
   off_t      filesize = 0;
   time_t     mtime = 0;
   char       *buf = NULL;
   uint8_t    *secret = NULL;
   int        secretLen = 0;
-  int        code = -1;
 
 #if defined(DEMO) || defined(TESTING)
   *error_msg = '\000';
@@ -1102,26 +1347,135 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   }
 
   // Read and process status file, then ask the user for the verification code.
-  int updated = 0;
+  int early_updated = 0, updated = 0;
   if ((username = get_user_name(pamh)) &&
       (secret_filename = get_secret_filename(pamh, &params, username, &uid)) &&
-      (old_uid = drop_privileges(pamh, username, uid)) >= 0 &&
-      (fd = open_secret_file(pamh, secret_filename, username, uid,
+      !drop_privileges(pamh, username, uid, &old_uid, &old_gid) &&
+      (fd = open_secret_file(pamh, secret_filename, &params, username, uid,
                              &filesize, &mtime)) >= 0 &&
       (buf = read_file_contents(pamh, secret_filename, &fd, filesize)) &&
       (secret = get_shared_secret(pamh, secret_filename, buf, &secretLen)) &&
-      (rate_limit(pamh, secret_filename, &updated, &buf) >= 0) &&
-      (code = request_verification_code(pamh)) >= 0) {
-    // Check all possible types of verification codes.
-    switch (check_scratch_codes(pamh, secret_filename, &updated, buf, code)) {
+       rate_limit(pamh, secret_filename, &early_updated, &buf) >= 0) {
+    long hotp_counter = get_hotp_counter(pamh, buf);
+    int must_advance_counter = 0;
+    char *pw = NULL, *saved_pw = NULL;
+    for (int mode = 0; mode < 4; ++mode) {
+      // In the case of TRY_FIRST_PASS, we don't actually know whether we
+      // get the verification code from the system password or from prompting
+      // the user. We need to attempt both.
+      // This only works correctly, if all failed attempts leave the global
+      // state unchanged.
+      if (updated || pw) {
+        // Oops. There is something wrong with the internal logic of our
+        // code. This error should never trigger. The unittest checks for
+        // this.
+        if (pw) {
+          memset(pw, 0, strlen(pw));
+          free(pw);
+          pw = NULL;
+        }
+        rc = PAM_SESSION_ERR;
+        break;
+      }
+      switch (mode) {
+      case 0: // Extract possible verification code
+      case 1: // Extract possible scratch code
+        if (params.pass_mode == USE_FIRST_PASS ||
+            params.pass_mode == TRY_FIRST_PASS) {
+          pw = get_first_pass(pamh);
+        }
+        break;
+      default:
+        if (mode != 2 && // Prompt for pw and possible verification code
+            mode != 3) { // Prompt for pw and possible scratch code
+          rc = PAM_SESSION_ERR;
+          continue;
+        }
+        if (params.pass_mode == PROMPT ||
+            params.pass_mode == TRY_FIRST_PASS) {
+          if (!saved_pw) {
+            // If forwarding the password to the next stacked PAM module,
+            // we cannot tell the difference between an eight digit scratch
+            // code or a two digit password immediately followed by a six
+            // digit verification code. We have to loop and try both
+            // options.
+            saved_pw = request_pass(pamh, params.echocode,
+                                    params.forward_pass ?
+                                    "Password & verification code: " :
+                                    "Verification code: ");
+          }
+          if (saved_pw) {
+            pw = strdup(saved_pw);
+          }
+        }
+        break;
+      }
+      if (!pw) {
+        continue;
+      }
+
+      // We are often dealing with a combined password and verification
+      // code. Separate them now.
+      int pw_len = strlen(pw);
+      int expected_len = mode & 1 ? 8 : 6;
+      char ch;
+      if (pw_len < expected_len ||
+          // Verification are six digits starting with '0'..'9',
+          // scratch codes are eight digits starting with '1'..'9'
+          (ch = pw[pw_len - expected_len]) > '9' ||
+          ch < (expected_len == 8 ? '1' : '0')) {
+      invalid:
+        memset(pw, 0, pw_len);
+        free(pw);
+        pw = NULL;
+        continue;
+      }
+      char *endptr;
+      errno = 0;
+      long l = strtol(pw + pw_len - expected_len, &endptr, 10);
+      if (errno || l < 0 || *endptr) {
+        goto invalid;
+      }
+      int code = (int)l;
+      memset(pw + pw_len - expected_len, 0, expected_len);
+
+      if ((mode == 2 || mode == 3) && !params.forward_pass) {
+        // We are explicitly configured so that we don't try to share
+        // the password with any other stacked PAM module. We must
+        // therefore verify that the user entered just the verification
+        // code, but no password.
+        if (*pw) {
+          goto invalid;
+        }
+      }
+
+      // Check all possible types of verification codes.
+      switch (check_scratch_codes(pamh, secret_filename, &updated, buf, code)){
       case 1:
-        switch (check_timebased_code(pamh, secret_filename, &updated, &buf,
-                                     secret, secretLen, code, &params)) {
+        if (hotp_counter > 0) {
+          switch (check_counterbased_code(pamh, secret_filename, &updated,
+                                          &buf, secret, secretLen, code,
+                                          &params, hotp_counter,
+                                          &must_advance_counter)) {
           case 0:
             rc = PAM_SUCCESS;
             break;
+          case 1:
+            goto invalid;
           default:
             break;
+          }
+        } else {
+          switch (check_timebased_code(pamh, secret_filename, &updated, &buf,
+                                       secret, secretLen, code, &params)) {
+          case 0:
+            rc = PAM_SUCCESS;
+            break;
+          case 1:
+            goto invalid;
+          default:
+            break;
+          }
         }
         break;
       case 0:
@@ -1129,6 +1483,39 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
         break;
       default:
         break;
+      }
+
+      break;
+    }
+
+    // Update the system password, if we were asked to forward
+    // the system password. We already removed the verification
+    // code from the end of the password.
+    if (rc == PAM_SUCCESS && params.forward_pass) {
+      if (!pw || pam_set_item(pamh, PAM_AUTHTOK, pw) != PAM_SUCCESS) {
+        rc = PAM_SESSION_ERR;
+      }
+    }
+
+    // Clear out password and deallocate memory
+    if (pw) {
+      memset(pw, 0, strlen(pw));
+      free(pw);
+    }
+    if (saved_pw) {
+      memset(saved_pw, 0, strlen(saved_pw));
+      free(saved_pw);
+    }
+
+    // If an hotp login attempt has been made, the counter must always be
+    // advanced by at least one.
+    if (must_advance_counter) {
+      char counter_str[40];
+      sprintf(counter_str, "%ld", hotp_counter + 1);
+      if (set_cfg_value(pamh, "HOTP_COUNTER", counter_str, &buf) < 0) {
+        rc = PAM_SESSION_ERR;
+      }
+      updated = 1;
     }
 
     // If nothing matched, display an error message
@@ -1137,8 +1524,15 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
     }
   }
 
+  // If the user has not created a state file with a shared secret, and if
+  // the administrator set the "nullok" option, this PAM module completes
+  // successfully, without ever prompting the user.
+  if (params.nullok == SECRETNOTFOUND) {
+    rc = PAM_SUCCESS;
+  }
+
   // Persist the new state.
-  if (updated) {
+  if (early_updated || updated) {
     if (write_file_contents(pamh, secret_filename, filesize,
                             mtime, buf) < 0) {
       // Could not persist new state. Deny access.
@@ -1148,8 +1542,16 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   if (fd >= 0) {
     close(fd);
   }
+  if (old_gid >= 0) {
+    if (setgroup(old_gid) >= 0 && setgroup(old_gid) == old_gid) {
+      old_gid = -1;
+    }
+  }
   if (old_uid >= 0) {
-    setuser(old_uid);
+    if (setuser(old_uid) < 0 || setuser(old_uid) != old_uid) {
+      log_message(LOG_EMERG, pamh, "We switched users from %d to %d, "
+                  "but can't switch back", old_uid, uid);
+    }
   }
   free(secret_filename);
 
@@ -1166,15 +1568,24 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
 }
 
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
+                                   int argc, const char **argv)
+  __attribute__((visibility("default")));
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
                                    int argc, const char **argv) {
   return google_authenticator(pamh, flags, argc, argv);
 }
 
 PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc,
+                                     const char **argv)
+  __attribute__((visibility("default")));
+PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc,
                                      const char **argv) {
   return PAM_SUCCESS;
 }
 
+PAM_EXTERN int pam_sm_open_session(pam_handle_t *pamh, int flags,
+                                   int argc, const char **argv)
+  __attribute__((visibility("default")));
 PAM_EXTERN int pam_sm_open_session(pam_handle_t *pamh, int flags,
                                    int argc, const char **argv) {
   return google_authenticator(pamh, flags, argc, argv);

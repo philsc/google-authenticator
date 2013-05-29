@@ -14,7 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+VERSION := 1.0
+
 .SUFFIXES: .so
+
+ifeq ($(origin CC), default)
+  CC := gcc
+endif
+
+DEF_CFLAGS := $(shell [ `uname` = SunOS ] &&                                  \
+                echo ' -D_POSIX_PTHREAD_SEMANTICS -D_REENTRANT')              \
+              -fvisibility=hidden $(CFLAGS)
+DEF_LDFLAGS := $(shell [ `uname` = SunOS ] && echo ' -mimpure-text') $(LDFLAGS)
+LDL_LDFLAGS := -ldl
 
 all: google-authenticator pam_google_authenticator.so demo                    \
      pam_google_authenticator_unittest
@@ -22,8 +34,17 @@ all: google-authenticator pam_google_authenticator.so demo                    \
 test: pam_google_authenticator_unittest
 	./pam_google_authenticator_unittest
 
+dist: clean all test
+	$(RM) libpam-google-authenticator-$(VERSION)-source.tar.bz2
+	tar jfc libpam-google-authenticator-$(VERSION)-source.tar.bz2         \
+	    --xform="s,^,libpam-google-authenticator-$(VERSION)/,"            \
+	    --owner=root --group=root                                         \
+	    *.c *.h *.html Makefile FILEFORMAT README utc-time
+
 install: all
-	@dst=/lib$$([ -d /lib64/security ] && echo 64)/security;              \
+	@dst="`find /lib*/security /lib*/*/security -maxdepth 1               \
+	            -name pam_unix.so -printf '%H' -quit 2>/dev/null`";       \
+	[ -d "$${dst}" ] || dst=/lib/security;                                \
 	[ -d "$${dst}" ] || dst=/usr/lib;                                     \
 	sudo=; if [ $$(id -u) -ne 0 ]; then                                   \
 	  echo "You need to be root to install this module.";                 \
@@ -44,20 +65,18 @@ install: all
 
 clean:
 	$(RM) *.o *.so core google-authenticator demo                         \
-	               pam_google_authenticator_unittest
+	               pam_google_authenticator_unittest                      \
+	               libpam-google-authenticator-*-source.tar.bz2
 
 google-authenticator: google-authenticator.o base32.o hmac.o sha1.o
-	$(CC) -g $(LDFLAGS)                                                   \
-	      -o $@ $+ -ldl
+	$(CC) -g $(DEF_LDFLAGS) -o $@ $+ $(LDL_LDFLAGS)
 
 demo: demo.o pam_google_authenticator_demo.o base32.o hmac.o sha1.o
-	$(CC) -g $(LDFLAGS) -rdynamic                                         \
-	      -o $@ $+ -ldl
+	$(CC) -g $(DEF_LDFLAGS) -rdynamic -o $@ $+ $(LDL_LDFLAGS)
 
 pam_google_authenticator_unittest: pam_google_authenticator_unittest.o        \
                                    base32.o hmac.o sha1.o
-	$(CC) -g $(LDFLAGS) -rdynamic -lc                                     \
-              -o $@ $+ -ldl
+	$(CC) -g $(DEF_LDFLAGS) -rdynamic -o $@ $+ -lc $(LDL_LDFLAGS)
 
 pam_google_authenticator.so: base32.o hmac.o sha1.o
 pam_google_authenticator_testing.so: base32.o hmac.o sha1.o
@@ -65,10 +84,11 @@ pam_google_authenticator_testing.so: base32.o hmac.o sha1.o
 pam_google_authenticator.o: pam_google_authenticator.c base32.h hmac.h sha1.h
 pam_google_authenticator_demo.o: pam_google_authenticator.c base32.h hmac.h   \
 	                         sha1.h
-	$(CC) -DDEMO --std=gnu99 -Wall -O2 -g -fPIC -c $(CFLAGS) -o $@ $<
+	$(CC) -DDEMO --std=gnu99 -Wall -O2 -g -fPIC -c $(DEF_CFLAGS) -o $@ $<
 pam_google_authenticator_testing.o: pam_google_authenticator.c base32.h       \
                                     hmac.h sha1.h
-	$(CC) -DTESTING --std=gnu99 -Wall -O2 -g -fPIC -c $(CFLAGS) -o $@ $<
+	$(CC) -DTESTING --std=gnu99 -Wall -O2 -g -fPIC -c $(DEF_CFLAGS)       \
+              -o $@ $<
 pam_google_authenticator_unittest.o: pam_google_authenticator_unittest.c      \
                                      pam_google_authenticator_testing.so      \
                                      base32.h hmac.h sha1.h
@@ -79,6 +99,6 @@ hmac.o: hmac.c hmac.h sha1.h
 sha1.o: sha1.c sha1.h
 
 .c.o:
-	$(CC) --std=gnu99 -Wall -O2 -g -fPIC -c $(CFLAGS) -o $@ $<
+	$(CC) --std=gnu99 -Wall -O2 -g -fPIC -c $(DEF_CFLAGS) -o $@ $<
 .o.so:
-	$(CC) -shared -g $(LDFLAGS) -o $@ $+
+	$(CC) -shared -g $(DEF_LDFLAGS) -o $@ $+ -lpam

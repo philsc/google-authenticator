@@ -1,2 +1,2 @@
-debian-create-central-makefile
-make-multiarch-friendly
+debian-create-central-makefile.diff
+debian-make-multiarch-friendly.diff

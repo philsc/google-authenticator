@@ -1,0 +1,17 @@
+Description: Uncondition linking to dl
+Author: LENART Janos <ocsi@debian.org>
+Origin: vendor
+Last-Update: 2013-05-29
+
+--- a/libpam/Makefile
++++ b/libpam/Makefile
+@@ -26,8 +26,7 @@
+                 echo ' -D_POSIX_PTHREAD_SEMANTICS -D_REENTRANT')              \
+               -fvisibility=hidden $(CFLAGS)
+ DEF_LDFLAGS := $(shell [ `uname` = SunOS ] && echo ' -mimpure-text') $(LDFLAGS)
+-LDL_LDFLAGS := $(shell $(CC) -shared -ldl -xc -o /dev/null /dev/null          \
+-                       >/dev/null 2>&1 && echo ' -ldl')
++LDL_LDFLAGS := -ldl
+ 
+ all: google-authenticator pam_google_authenticator.so demo                    \
+      pam_google_authenticator_unittest
