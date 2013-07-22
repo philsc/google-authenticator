@@ -1,3 +1,9 @@
+google-authenticator (20130529-2) unstable; urgency=low
+
+  * Included README
+
+ -- LENART Janos <ocsi@debian.org>  Mon, 22 Jul 2013 09:58:36 +0100
+
 google-authenticator (20130529-1) unstable; urgency=low
 
   * Upstream update. (Closes: #660188)
