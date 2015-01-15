@@ -60,6 +60,7 @@
 typedef struct Params {
   const char *secret_filename_spec;
   enum { NULLERR=0, NULLOK, SECRETNOTFOUND } nullok;
+  int        nullfake;
   int        noskewadj;
   int        echocode;
   int        fixed_uid;
@@ -332,6 +333,12 @@ static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
   struct stat sb;
   if (fd < 0 ||
       fstat(fd, &sb) < 0) {
+    if (params->nullfake) {
+      // We want to create a fake secret if it doesn't exist so that the 
+      // interface doesn't look different between two-factor enabled users and 
+      // others.
+      return -1;
+    }
     if (params->nullok != NULLERR && errno == ENOENT) {
       // The user doesn't have a state file, but the admininistrator said
       // that this is OK. We still return an error from open_secret_file(),
@@ -1313,6 +1320,8 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
       params->noskewadj = 1;
     } else if (!strcmp(argv[i], "nullok")) {
       params->nullok = NULLOK;
+    } else if (!strcmp(argv[i], "nullfake")) {
+      params->nullfake = 1;
     } else if (!strcmp(argv[i], "echo-verification-code") ||
                !strcmp(argv[i], "echo_verification_code")) {
       params->echocode = PAM_PROMPT_ECHO_ON;
@@ -1522,6 +1531,18 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
     if (rc != PAM_SUCCESS) {
       log_message(LOG_ERR, pamh, "Invalid verification code");
     }
+  }
+
+  // If the user has no token but the administrator set the "nullfake" option, 
+  // this PAM module queries the verification code regardless but is guaranteed 
+  // to fail.
+  if (fd < 0 && params.nullfake) {
+    saved_pw = request_pass(pamh, params.echocode, "Verification code: ");
+    if (saved_pw) {
+      memset(saved_pw, 0, strlen(saved_pw));
+      free(saved_pw);
+    }
+    rc = PAM_SESSION_ERR;
   }
 
   // If the user has not created a state file with a shared secret, and if
