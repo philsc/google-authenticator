@@ -1536,7 +1536,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   // If the user has no token but the administrator set the "nullfake" option, 
   // this PAM module queries the verification code regardless but is guaranteed 
   // to fail.
-  if (fd < 0 && params.nullfake) {
+  if (secret == NULL && params.nullfake) {
     char* saved_pw = request_pass(pamh, params.echocode, "Verification code: ");
     if (saved_pw) {
       memset(saved_pw, 0, strlen(saved_pw));
